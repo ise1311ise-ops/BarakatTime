@@ -1,0 +1,50 @@
+name: Build BarakatTime firmware
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO and esptool
+        run: pip install -U platformio esptool
+
+      - name: Fetch Arduino_DriveBus library (не публикуется в реестре PlatformIO)
+        run: |
+          curl -L -o ws_demo.zip https://github.com/waveshareteam/ESP32-S3-Touch-LCD-1.69/archive/refs/heads/main.zip
+          unzip -q ws_demo.zip
+          mkdir -p lib
+          cp -r ESP32-S3-Touch-LCD-1.69-main/Arduino/libraries/Arduino_DriveBus lib/Arduino_DriveBus
+
+      - name: Build firmware
+        run: pio run -e esp32-s3
+
+      - name: Merge images into one flashable .bin
+        run: |
+          BUILD_DIR=.pio/build/esp32-s3
+          python -m esptool --chip esp32s3 merge_bin -o BarakatTime_merged.bin \
+            --flash_mode dio --flash_freq 80m --flash_size 16MB \
+            0x0     $BUILD_DIR/bootloader.bin \
+            0x8000  $BUILD_DIR/partitions.bin \
+            0x10000 $BUILD_DIR/firmware.bin
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: BarakatTime-firmware
+          path: |
+            .pio/build/esp32-s3/firmware.bin
+            .pio/build/esp32-s3/bootloader.bin
+            .pio/build/esp32-s3/partitions.bin
+            BarakatTime_merged.bin
