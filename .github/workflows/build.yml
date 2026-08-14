@@ -20,12 +20,20 @@ jobs:
       - name: Install PlatformIO and esptool
         run: pip install -U platformio esptool
 
-      - name: Fetch Arduino_DriveBus library (не публикуется в реестре PlatformIO)
+      - name: Fetch libraries bundled by Waveshare (проверенные версии под эту плату)
         run: |
           curl -L -o ws_demo.zip https://github.com/waveshareteam/ESP32-S3-Touch-LCD-1.69/archive/refs/heads/main.zip
           unzip -q ws_demo.zip
           mkdir -p lib
-          cp -r ESP32-S3-Touch-LCD-1.69-main/Arduino/libraries/Arduino_DriveBus lib/Arduino_DriveBus
+          SRC=$(find ESP32-S3-Touch-LCD-1.69-main -type d -iname "libraries" | head -n1)
+          if [ -z "$SRC" ]; then
+            echo "Папка libraries не найдена, вот структура репозитория для отладки:"
+            find ESP32-S3-Touch-LCD-1.69-main -maxdepth 5 -type d
+            exit 1
+          fi
+          echo "Нашёл библиотеки тут: $SRC"
+          ls -la "$SRC"
+          cp -r "$SRC"/* lib/
 
       - name: Build firmware
         run: pio run -e esp32-s3
