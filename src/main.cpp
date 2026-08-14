@@ -10,13 +10,13 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include <LittleFS.h>
-#include <PNGdec.h>
 #include "HWCDC.h"
 #include "Arduino_GFX_Library.h"
 #include "Arduino_DriveBus_Library.h"
 #include "SensorPCF85063.hpp"
 #include "pin_config.h"
+#include "fon_data.h"
+#include "brand_data.h"
 
 HWCDC USBSerial;
 
@@ -87,52 +87,6 @@ struct PrayerTimes {
 };
 PrayerTimes prayers;
 unsigned long lastPrayerFetch = 0;
-
-// ---------- PNG-декодер (для чтения fon.png/brand.png из файловой системы) ----------
-PNG png;
-File pngFile;
-int pngDrawX = 0, pngDrawY = 0;
-bool pngSkipMagenta = false;
-const uint16_t MAGENTA_565 = 0xF81F; // "цвет-невидимка" для прозрачного фона логотипа
-
-void *pngOpen(const char *filename, int32_t *size) {
-  pngFile = LittleFS.open(filename, "r");
-  *size = pngFile.size();
-  return &pngFile;
-}
-void pngClose(void *handle) { ((File *)handle)->close(); }
-int32_t pngRead(PNGFILE *page, uint8_t *buffer, int32_t length) {
-  return ((File *)page->fHandle)->read(buffer, length);
-}
-int32_t pngSeek(PNGFILE *page, int32_t position) {
-  return ((File *)page->fHandle)->seek(position);
-}
-
-void pngDrawLine(PNGDRAW *pDraw) {
-  uint16_t lineBuf[320];
-  png.getLineAsRGB565(pDraw, lineBuf, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
-
-  if (!pngSkipMagenta) {
-    gfx->draw16bitRGBBitmap(pngDrawX, pngDrawY + pDraw->y, lineBuf, pDraw->iWidth, 1);
-    return;
-  }
-  for (int x = 0; x < pDraw->iWidth; x++) {
-    if (lineBuf[x] == MAGENTA_565) continue; // прозрачный пиксель - пропускаем
-    gfx->drawPixel(pngDrawX + x, pngDrawY + pDraw->y, lineBuf[x]);
-  }
-}
-
-void drawPngFromFS(const char *path, int x, int y, bool skipMagenta) {
-  pngDrawX = x; pngDrawY = y; pngSkipMagenta = skipMagenta;
-  int rc = png.open(path, pngOpen, pngClose, pngRead, pngSeek, pngDrawLine);
-  if (rc == PNG_SUCCESS) {
-    png.decode(NULL, 0);
-    png.close();
-  } else {
-    USBSerial.print("Не открылся PNG: ");
-    USBSerial.println(path);
-  }
-}
 
 // ---------- Кнопка PWR (SYS_OUT) ----------
 struct PwrButton {
@@ -369,12 +323,46 @@ void fetchPrayerTimes() {
 // =================== Отрисовка премиальных экранов ===================
 
 void drawSplashScreen() {
-  if (!LittleFS.begin(true)) {
-    USBSerial.println("LittleFS не смонтировался!");
-    return;
+  // 1. Фон рисуется один раз, целиком
+  gfx->draw16bitRGBBitmap(0, 0, (uint16_t*)fon_rgb, FON_WIDTH, FON_HEIGHT);
+
+  int bx = (LCD_WIDTH - BRAND_WIDTH) / 2;
+  int by = (LCD_HEIGHT - BRAND_HEIGHT) / 2;
+
+  const int STEPS = 24;            // сколько кадров в анимации
+  const int FRAME_DELAY_MS = 20;   // задержка между кадрами (24 x 20мс ≈ 0.5 сек)
+
+  static uint16_t lineBuf[BRAND_WIDTH];
+
+  for (int step = 1; step <= STEPS; step++) {
+    float t = (float)step / STEPS; // 0.0 -> 1.0, прогресс появления
+
+    for (int y = 0; y < BRAND_HEIGHT; y++) {
+      for (int x = 0; x < BRAND_WIDTH; x++) {
+        uint8_t a = pgm_read_byte(&brand_alpha[y * BRAND_WIDTH + x]);
+        uint16_t bgPixel = pgm_read_word(&fon_rgb[(by + y) * FON_WIDTH + (bx + x)]);
+
+        if (a == 0) {
+          lineBuf[x] = bgPixel; // прозрачный пиксель лого - оставляем фон
+          continue;
+        }
+
+        uint16_t fgPixel = pgm_read_word(&brand_rgb[y * BRAND_WIDTH + x]);
+        float alpha = (a / 255.0f) * t; // текущая "видимость" пикселя в этом кадре
+
+        uint8_t br = (bgPixel >> 11) & 0x1F, bg = (bgPixel >> 5) & 0x3F, bb = bgPixel & 0x1F;
+        uint8_t fr = (fgPixel >> 11) & 0x1F, fg = (fgPixel >> 5) & 0x3F, fb = fgPixel & 0x1F;
+
+        uint8_t r = br + (uint8_t)((fr - br) * alpha);
+        uint8_t g = bg + (uint8_t)((fg - bg) * alpha);
+        uint8_t b = bb + (uint8_t)((fb - bb) * alpha);
+
+        lineBuf[x] = (r << 11) | (g << 5) | b;
+      }
+      gfx->draw16bitRGBBitmap(bx, by + y, lineBuf, BRAND_WIDTH, 1);
+    }
+    delay(FRAME_DELAY_MS);
   }
-  drawPngFromFS("/fon.png", 0, 0, false);
-  drawPngFromFS("/brand.png", 0, 0, true);
 }
 
 void drawTasbeehScreen() {
