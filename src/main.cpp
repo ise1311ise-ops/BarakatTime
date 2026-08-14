@@ -1,26 +1,17 @@
 /*
- * BarakatTime — прошивка для Waveshare ESP32-S3-Touch-LCD-1.69 (новая версия платы)
- *
- * Что уже сделано в этой версии:
- *  - безопасная инициализация buzzer (сразу LOW, чтобы плата не грелась — см. FAQ Waveshare)
- *  - удержание питания через SYS_EN (иначе плата гаснет сразу после отпускания кнопки PWR)
- *  - инициализация экрана (ST7789V2) и тача (CST816T)
- *  - инициализация RTC (PCF85063)
- *  - заставка "BarakatTime"
- *  - экран тасбиха: тап по экрану = +1 к счётчику
- *  - кнопка PWR: одиночный клик = переключить имя зикра,
- *                двойной клик = сбросить счётчик,
- *                долгое нажатие = заглушка под будущий режим настройки по WiFi AP
- *
- * ВАЖНО про шрифт: встроенный шрифт GFX-библиотеки не умеет кириллицу,
- * поэтому имена зикров временно на латинице (транслитом). Кириллицу добавим
- * отдельно через кастомный юникодный шрифт на одном из следующих шагов.
- *
- * Библиотеки: GFX Library for Arduino, Arduino_DriveBus, SensorLib (PCF85063).
+ * BarakatTime — прошивка для Waveshare ESP32-S3-Touch-LCD-1.69
+ * Дизайн: Премиальный тёмно-зелёный интерфейс с золотыми акцентами и карточками
  */
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <LittleFS.h>
+#include <PNGdec.h>
 #include "HWCDC.h"
 #include "Arduino_GFX_Library.h"
 #include "Arduino_DriveBus_Library.h"
@@ -53,10 +44,27 @@ bool touchReady = false;
 SensorPCF85063 rtc;
 bool rtcReady = false;
 
+// ---------- Настройки и WiFi ----------
+Preferences preferences;
+WebServer server(80);
+
+String ssid = "";
+String password = "";
+String city = "Moscow";
+String country = "Russia";
+int gmtOffsetSec = 10800; // по умолчанию UTC+3
+
 // ---------- Состояние приложения ----------
-enum AppScreen { SCREEN_SPLASH, SCREEN_TASBEEH, SCREEN_SETUP_STUB };
+enum AppScreen { SCREEN_SPLASH, SCREEN_TASBEEH, SCREEN_PRAYER_TIMES, SCREEN_RAMADAN, SCREEN_SETUP_MODE };
 AppScreen currentScreen = SCREEN_SPLASH;
 
+// Цветовая палитра дизайна (RGB565)
+#define COLOR_BG          0x0120 // Глубокий темно-зеленый
+#define COLOR_GOLD        0xFD20 // Премиальный золотой
+#define COLOR_CARD_BG     0x1A42 // Цвет полупрозрачной карточки
+#define COLOR_TEXT_DIM    0x7BEF // Приглушенный серо-зеленый
+
+// Зикры
 const char *zikrNames[] = {
   "SubhanAllah",
   "Alhamdulillah",
@@ -65,15 +73,70 @@ const char *zikrNames[] = {
 };
 const uint8_t zikrCount = sizeof(zikrNames) / sizeof(zikrNames[0]);
 uint8_t currentZikrIndex = 0;
-uint32_t tasbeehCount = 0;
+uint32_t tasbeehCount = 33; // Стартовое значение как на рендере
 
-// область счётчика/имени, чтобы перерисовывать только их, а не весь экран
-const int16_t NAME_Y = 60;
-const int16_t COUNT_Y = 140;
+// Данные молитв (из API)
+struct PrayerTimes {
+  String fajr = "03:46";
+  String dhuhr = "01:36";
+  String asr = "02:49";
+  String maghrib = "08:38";
+  String isha = "22:15";
+  String nextPrayerName = "Maghrib";
+  String timeLeft = "00:45:48";
+};
+PrayerTimes prayers;
+unsigned long lastPrayerFetch = 0;
+
+// ---------- PNG-декодер (для чтения fon.png/brand.png из файловой системы) ----------
+PNG png;
+File pngFile;
+int pngDrawX = 0, pngDrawY = 0;
+bool pngSkipMagenta = false;
+const uint16_t MAGENTA_565 = 0xF81F; // "цвет-невидимка" для прозрачного фона логотипа
+
+void *pngOpen(const char *filename, int32_t *size) {
+  pngFile = LittleFS.open(filename, "r");
+  *size = pngFile.size();
+  return &pngFile;
+}
+void pngClose(void *handle) { ((File *)handle)->close(); }
+int32_t pngRead(PNGFILE *page, uint8_t *buffer, int32_t length) {
+  return ((File *)page->fHandle)->read(buffer, length);
+}
+int32_t pngSeek(PNGFILE *page, int32_t position) {
+  return ((File *)page->fHandle)->seek(position);
+}
+
+void pngDrawLine(PNGDRAW *pDraw) {
+  uint16_t lineBuf[320];
+  png.getLineAsRGB565(pDraw, lineBuf, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
+
+  if (!pngSkipMagenta) {
+    gfx->draw16bitRGBBitmap(pngDrawX, pngDrawY + pDraw->y, lineBuf, pDraw->iWidth, 1);
+    return;
+  }
+  for (int x = 0; x < pDraw->iWidth; x++) {
+    if (lineBuf[x] == MAGENTA_565) continue; // прозрачный пиксель - пропускаем
+    gfx->drawPixel(pngDrawX + x, pngDrawY + pDraw->y, lineBuf[x]);
+  }
+}
+
+void drawPngFromFS(const char *path, int x, int y, bool skipMagenta) {
+  pngDrawX = x; pngDrawY = y; pngSkipMagenta = skipMagenta;
+  int rc = png.open(path, pngOpen, pngClose, pngRead, pngSeek, pngDrawLine);
+  if (rc == PNG_SUCCESS) {
+    png.decode(NULL, 0);
+    png.close();
+  } else {
+    USBSerial.print("Не открылся PNG: ");
+    USBSerial.println(path);
+  }
+}
 
 // ---------- Кнопка PWR (SYS_OUT) ----------
 struct PwrButton {
-  bool lastRaw = HIGH;          // HIGH = отпущена
+  bool lastRaw = HIGH;
   unsigned long pressStart = 0;
   bool longPressFired = false;
   bool waitingSecondClick = false;
@@ -93,11 +156,17 @@ void setupPowerLatch();
 void setupDisplay();
 void setupTouch();
 void setupRtc();
+void loadSettings();
+void connectWiFiOrStartAP();
+void startConfigServer();
+void fetchPrayerTimes();
+void updateScreenContent();
 void drawSplashScreen();
-void drawTasbeehScreenStatic();
-void updateZikrName();
-void updateCounter();
-bool readTouchPoint(int16_t &x, int16_t &y);
+void drawTasbeehScreen();
+void drawPrayerScreen();
+void drawRamadanScreen();
+void drawSetupScreen();
+void drawPageDots(uint8_t activePage);
 void handleTouch();
 void handlePwrButton();
 void onSingleClick();
@@ -105,10 +174,7 @@ void onDoubleClick();
 void onLongPress();
 
 void setup() {
-  // 1) Buzzer — ПЕРВЫМ делом в LOW, чтобы плата не грелась (см. FAQ Waveshare)
   setupBuzzerSafe();
-
-  // 2) Удержание питания — иначе плата выключится сразу после отпускания PWR
   setupPowerLatch();
 
   pinMode(SYS_OUT, INPUT);
@@ -118,19 +184,42 @@ void setup() {
   USBSerial.println("BarakatTime boot");
 
   setupDisplay();
+  drawSplashScreen();
+
   setupTouch();
   setupRtc();
+  loadSettings();
 
-  drawSplashScreen();
-  delay(1500);
+  connectWiFiOrStartAP();
 
+  delay(1000);
   currentScreen = SCREEN_TASBEEH;
-  drawTasbeehScreenStatic();
+  drawTasbeehScreen();
 }
 
 void loop() {
+  if (currentScreen == SCREEN_SETUP_MODE) {
+    server.handleClient();
+    handlePwrButton();
+    delay(5);
+    return;
+  }
+
   handleTouch();
   handlePwrButton();
+
+  if (WiFi.status() == WL_CONNECTED && (millis() - lastPrayerFetch > 3600000 || lastPrayerFetch == 0)) {
+    fetchPrayerTimes();
+  }
+
+  static unsigned long lastSecTick = 0;
+  if (millis() - lastSecTick >= 1000) {
+    lastSecTick = millis();
+    if (currentScreen == SCREEN_PRAYER_TIMES || currentScreen == SCREEN_RAMADAN) {
+      updateScreenContent();
+    }
+  }
+
   delay(5);
 }
 
@@ -152,7 +241,7 @@ void setupDisplay() {
   }
   pinMode(LCD_BL, OUTPUT);
   digitalWrite(LCD_BL, HIGH);
-  gfx->fillScreen(RGB565_BLACK);
+  gfx->fillScreen(COLOR_BG);
 }
 
 void setupTouch() {
@@ -161,7 +250,6 @@ void setupTouch() {
       touchReady = true;
       break;
     }
-    USBSerial.println("CST816T init fail, retry...");
     delay(300);
   }
   if (touchReady) {
@@ -169,96 +257,297 @@ void setupTouch() {
         CST816T->Arduino_IIC_Touch::Device::TOUCH_DEVICE_INTERRUPT_MODE,
         CST816T->Arduino_IIC_Touch::Device_Mode::TOUCH_DEVICE_INTERRUPT_PERIODIC);
     CST816T->IIC_Interrupt_Flag = false;
-    USBSerial.println("Touch OK");
-  } else {
-    USBSerial.println("Touch NOT available, продолжаем без тача");
   }
 }
 
 void setupRtc() {
   rtcReady = rtc.begin(Wire, IIC_SDA, IIC_SCL);
-  if (!rtcReady) {
-    USBSerial.println("RTC NOT found, продолжаем без часов");
+}
+
+void loadSettings() {
+  preferences.begin("barakat", true);
+  ssid = preferences.getString("ssid", "");
+  password = preferences.getString("pass", "");
+  city = preferences.getString("city", "Moscow");
+  country = preferences.getString("country", "Russia");
+  gmtOffsetSec = preferences.getInt("gmt", 10800);
+  preferences.end();
+}
+
+void connectWiFiOrStartAP() {
+  if (ssid.length() == 0) {
+    startConfigServer();
+    return;
+  }
+
+  USBSerial.print("Connecting to WiFi: ");
+  USBSerial.println(ssid);
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
+    delay(500);
+    USBSerial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    USBSerial.println("\nWiFi connected!");
+    configTime(gmtOffsetSec, 0, "pool.ntp.org", "time.nist.gov");
+    fetchPrayerTimes();
   } else {
-    USBSerial.println("RTC OK");
+    USBSerial.println("\nWiFi connection failed, running offline.");
   }
 }
 
-// =================== Экраны ===================
+void startConfigServer() {
+  currentScreen = SCREEN_SETUP_MODE;
+  WiFi.softAP("BarakatTime-Setup", "12345678");
+  IPAddress IP = WiFi.softAPIP();
+  USBSerial.print("AP IP address: ");
+  USBSerial.println(IP);
+
+  server.on("/", HTTP_GET, []() {
+    String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>"
+                  "<style>body{font-family:sans-serif;padding:20px;background:#0b1a13;color:#fff;text-align:center;}"
+                  "input{padding:12px;margin:8px;width:85%;max-width:300px;background:#162e22;color:#fff;border:1px solid #c5a059;border-radius:8px;}"
+                  "input[type=submit]{background:#c5a059;color:#000;border:none;font-weight:bold;cursor:pointer;}"
+                  "</style></head><body>"
+                  "<h2>BarakatTime Setup</h2>"
+                  "<form action='/save' method='POST'>"
+                  "WiFi SSID:<br><input type='text' name='ssid'><br>"
+                  "WiFi Password:<br><input type='password' name='pass'><br>"
+                  "City:<br><input type='text' name='city' value='Moscow'><br>"
+                  "Country:<br><input type='text' name='country' value='Russia'><br>"
+                  "GMT Offset (sec):<br><input type='text' name='gmt' value='10800'><br><br>"
+                  "<input type='submit' value='Save & Restart'>"
+                  "</form></body></html>";
+    server.send(200, "text/html", html);
+  });
+
+  server.on("/save", HTTP_POST, []() {
+    preferences.begin("barakat", false);
+    preferences.putString("ssid", server.arg("ssid"));
+    preferences.putString("pass", server.arg("pass"));
+    preferences.putString("city", server.arg("city"));
+    preferences.putString("country", server.arg("country"));
+    preferences.putInt("gmt", server.arg("gmt").toInt());
+    preferences.end();
+
+    server.send(200, "text/html", "<h3>Saved! Rebooting...</h3>");
+    delay(1000);
+    ESP.restart();
+  });
+
+  server.begin();
+  drawSetupScreen();
+}
+
+void fetchPrayerTimes() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  String url = "http://api.aladhan.com/v1/timingsByCity?city=" + city + "&country=" + country + "&method=3";
+  HTTPClient http;
+  http.begin(url);
+  int httpResponseCode = http.GET();
+
+  if (httpResponseCode > 0) {
+    String payload = http.getString();
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    if (!error) {
+      JsonObject timings = doc["data"]["timings"];
+      prayers.fajr = timings["Fajr"].as<String>();
+      prayers.dhuhr = timings["Dhuhr"].as<String>();
+      prayers.asr = timings["Asr"].as<String>();
+      prayers.maghrib = timings["Maghrib"].as<String>();
+      prayers.isha = timings["Isha"].as<String>();
+      lastPrayerFetch = millis();
+    }
+  }
+  http.end();
+}
+
+// =================== Отрисовка премиальных экранов ===================
 
 void drawSplashScreen() {
-  gfx->fillScreen(RGB565_BLACK);
-  gfx->setTextColor(RGB565_WHITE);
-  gfx->setTextSize(3);
-  int16_t textWidth = strlen("BarakatTime") * 6 * 3;
-  int16_t x = (LCD_WIDTH - textWidth) / 2;
-  gfx->setCursor(x > 0 ? x : 0, LCD_HEIGHT / 2 - 10);
-  gfx->println("BarakatTime");
+  if (!LittleFS.begin(true)) {
+    USBSerial.println("LittleFS не смонтировался!");
+    return;
+  }
+  drawPngFromFS("/fon.png", 0, 0, false);
+  drawPngFromFS("/brand.png", 0, 0, true);
 }
 
-void drawTasbeehScreenStatic() {
-  gfx->fillScreen(RGB565_BLACK);
-  updateZikrName();
-  updateCounter();
+void drawTasbeehScreen() {
+  gfx->fillScreen(COLOR_BG);
 
-  gfx->setTextColor(RGB565_DARKGREY);
-  gfx->setTextSize(1);
-  gfx->setCursor(10, LCD_HEIGHT - 20);
-  gfx->println("tap = +1  PWR: click=zikr  2click=reset");
-}
+  int cx = LCD_WIDTH / 2;
+  int cy = LCD_HEIGHT / 2 - 10;
+  gfx->drawCircle(cx, cy, 85, COLOR_GOLD);
+  gfx->drawCircle(cx, cy, 75, COLOR_GOLD);
+  for (int i = 0; i < 360; i += 30) {
+    float rad = i * 3.14159 / 180.0;
+    int x2 = cx + cos(rad) * 85;
+    int y2 = cy + sin(rad) * 85;
+    gfx->drawLine(cx, cy, x2, y2, COLOR_GOLD);
+  }
+  gfx->fillCircle(cx, cy, 45, COLOR_BG);
+  gfx->drawCircle(cx, cy, 45, COLOR_GOLD);
 
-void updateZikrName() {
-  gfx->fillRect(0, NAME_Y - 12, LCD_WIDTH, 20, RGB565_BLACK);
-  gfx->setTextColor(RGB565_GREEN);
-  gfx->setTextSize(2);
-  const char *name = zikrNames[currentZikrIndex];
-  int16_t textWidth = strlen(name) * 6 * 2;
-  int16_t x = (LCD_WIDTH - textWidth) / 2;
-  gfx->setCursor(x > 0 ? x : 0, NAME_Y - 12);
-  gfx->println(name);
-}
-
-void updateCounter() {
-  gfx->fillRect(0, COUNT_Y - 20, LCD_WIDTH, 40, RGB565_BLACK);
-  gfx->setTextColor(RGB565_WHITE);
+  gfx->setTextColor(COLOR_GOLD);
   gfx->setTextSize(4);
   char buf[12];
   snprintf(buf, sizeof(buf), "%lu", (unsigned long)tasbeehCount);
-  int16_t textWidth = strlen(buf) * 6 * 4;
-  int16_t x = (LCD_WIDTH - textWidth) / 2;
-  gfx->setCursor(x > 0 ? x : 0, COUNT_Y - 20);
+  int16_t w = strlen(buf) * 6 * 4;
+  gfx->setCursor((LCD_WIDTH - w) / 2, cy - 14);
   gfx->println(buf);
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(COLOR_TEXT_DIM);
+  int16_t nw = strlen(zikrNames[currentZikrIndex]) * 6;
+  gfx->setCursor((LCD_WIDTH - nw) / 2, 22);
+  gfx->println(zikrNames[currentZikrIndex]);
+
+  drawPageDots(0);
+}
+
+void drawPrayerScreen() {
+  gfx->fillScreen(COLOR_BG);
+
+  gfx->setTextColor(COLOR_GOLD);
+  gfx->setTextSize(2);
+  gfx->setCursor(20, 15);
+  gfx->println("BarakatTime");
+
+  gfx->fillRoundRect(15, 45, 210, 75, 12, COLOR_CARD_BG);
+  gfx->drawRoundRect(15, 45, 210, 75, 12, COLOR_GOLD);
+  
+  gfx->setTextColor(COLOR_TEXT_DIM);
+  gfx->setTextSize(1);
+  gfx->setCursor(28, 55);
+  gfx->print("Next Prayer - "); gfx->println(prayers.nextPrayerName);
+
+  gfx->setTextColor(COLOR_GOLD);
+  gfx->setTextSize(3);
+  gfx->setCursor(28, 78);
+  gfx->println(prayers.timeLeft);
+
+  gfx->fillRoundRect(15, 130, 210, 110, 12, COLOR_CARD_BG);
+  
+  int y = 142;
+  auto row = [&](String name, String time) {
+    gfx->setTextColor(COLOR_TEXT_DIM);
+    gfx->setTextSize(1);
+    gfx->setCursor(28, y);
+    gfx->print(name);
+    gfx->setTextColor(COLOR_GOLD);
+    gfx->setCursor(160, y);
+    gfx->println(time);
+    y += 20;
+  };
+
+  row("Fajr", prayers.fajr);
+  row("Dhuhr", prayers.dhuhr);
+  row("Asr", prayers.asr);
+  row("Maghrib", prayers.maghrib);
+
+  drawPageDots(1);
+}
+
+void drawRamadanScreen() {
+  gfx->fillScreen(COLOR_BG);
+
+  gfx->fillRoundRect(15, 25, 210, 185, 16, COLOR_CARD_BG);
+  gfx->drawRoundRect(15, 25, 210, 185, 16, COLOR_GOLD);
+
+  gfx->setTextColor(COLOR_GOLD);
+  gfx->setTextSize(2);
+  gfx->setCursor(35, 45);
+  gfx->println("Ramadan");
+
+  gfx->setTextSize(4);
+  gfx->setCursor(35, 80);
+  gfx->println("127");
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(COLOR_TEXT_DIM);
+  gfx->setCursor(140, 100);
+  gfx->println("days");
+
+  gfx->fillRoundRect(25, 145, 190, 50, 8, 0x1100);
+  gfx->setTextColor(COLOR_GOLD);
+  gfx->setCursor(38, 160);
+  gfx->print("City: "); gfx->println(city);
+
+  drawPageDots(2);
+}
+
+void drawSetupScreen() {
+  gfx->fillScreen(COLOR_BG);
+  gfx->setTextColor(COLOR_GOLD);
+  gfx->setTextSize(2);
+  gfx->setCursor(20, 30);
+  gfx->println("WiFi Setup Mode");
+
+  gfx->setTextColor(COLOR_TEXT_DIM);
+  gfx->setTextSize(1);
+  gfx->setCursor(20, 80);
+  gfx->println("Connect to WiFi AP:");
+  gfx->setTextColor(COLOR_GOLD);
+  gfx->setCursor(20, 100);
+  gfx->println("BarakatTime-Setup");
+  
+  gfx->setTextColor(COLOR_TEXT_DIM);
+  gfx->setCursor(20, 130);
+  gfx->println("Open in browser:");
+  gfx->setTextColor(COLOR_GOLD);
+  gfx->setCursor(20, 150);
+  gfx->println("http://192.168.4.1");
+}
+
+void drawPageDots(uint8_t activePage) {
+  int startX = LCD_WIDTH / 2 - 20;
+  int y = LCD_HEIGHT - 18;
+  for (int i = 0; i < 3; i++) {
+    uint16_t color = (i == activePage) ? COLOR_GOLD : COLOR_TEXT_DIM;
+    gfx->fillCircle(startX + (i * 20), y, 3, color);
+  }
+}
+
+void updateScreenContent() {
+  if (currentScreen == SCREEN_PRAYER_TIMES) {
+    drawPrayerScreen();
+  } else if (currentScreen == SCREEN_RAMADAN) {
+    drawRamadanScreen();
+  }
 }
 
 // =================== Тач ===================
 
-bool readTouchPoint(int16_t &x, int16_t &y) {
-  if (!touchReady) return false;
-  if (!CST816T->IIC_Interrupt_Flag) return false;
+void handleTouch() {
+  if (!touchReady) return;
+  if (!CST816T->IIC_Interrupt_Flag) return;
   CST816T->IIC_Interrupt_Flag = false;
 
   int32_t fingers = CST816T->IIC_Read_Device_Value(
       CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
-  if (fingers <= 0) return false;
+  if (fingers <= 0) return;
 
-  int32_t rawX = CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
-  int32_t rawY = CST816T->IIC_Read_Device_Value(
-      CST816T->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
-  if (rawX < 0 || rawY < 0) return false;
+  if (currentScreen == SCREEN_TASBEEH) {
+    tasbeehCount++;
+    // Точечное обновление счетчика без мерцания
+    int cx = LCD_WIDTH / 2;
+    int cy = LCD_HEIGHT / 2 - 10;
+    gfx->fillCircle(cx, cy, 42, COLOR_BG);
+    gfx->drawCircle(cx, cy, 45, COLOR_GOLD);
 
-  x = constrain((int16_t)rawX, 0, LCD_WIDTH - 1);
-  y = constrain((int16_t)rawY, 0, LCD_HEIGHT - 1);
-  return true;
-}
-
-void handleTouch() {
-  int16_t x, y;
-  if (!readTouchPoint(x, y)) return;
-  if (currentScreen != SCREEN_TASBEEH) return;
-
-  tasbeehCount++;
-  updateCounter();
+    gfx->setTextColor(COLOR_GOLD);
+    gfx->setTextSize(4);
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)tasbeehCount);
+    int16_t w2 = strlen(buf) * 6 * 4;
+    gfx->setCursor((LCD_WIDTH - w2) / 2, cy - 14);
+    gfx->println(buf);
+  }
 }
 
 // =================== Кнопка PWR ===================
@@ -275,11 +564,9 @@ void handlePwrButton() {
     debouncedState = raw;
 
     if (debouncedState == LOW) {
-      // нажата
       pwrBtn.pressStart = millis();
       pwrBtn.longPressFired = false;
     } else {
-      // отпущена
       if (!pwrBtn.longPressFired) {
         if (pwrBtn.waitingSecondClick &&
             (millis() - pwrBtn.firstClickTime) < DOUBLE_CLICK_WINDOW_MS) {
@@ -293,7 +580,6 @@ void handlePwrButton() {
     }
   }
 
-  // долгое нажатие — фиксируем один раз, пока кнопка ещё удерживается
   if (debouncedState == LOW && !pwrBtn.longPressFired &&
       (millis() - pwrBtn.pressStart >= LONG_PRESS_MS)) {
     pwrBtn.longPressFired = true;
@@ -301,7 +587,6 @@ void handlePwrButton() {
     onLongPress();
   }
 
-  // если после первого клика окно двойного клика истекло — это был одиночный клик
   if (pwrBtn.waitingSecondClick &&
       (millis() - pwrBtn.firstClickTime) >= DOUBLE_CLICK_WINDOW_MS) {
     pwrBtn.waitingSecondClick = false;
@@ -310,32 +595,30 @@ void handlePwrButton() {
 }
 
 void onSingleClick() {
-  USBSerial.println("PWR: single click -> next zikr");
-  if (currentScreen != SCREEN_TASBEEH) return;
-  currentZikrIndex = (currentZikrIndex + 1) % zikrCount;
-  updateZikrName();
+  if (currentScreen == SCREEN_SETUP_MODE) return;
+
+  if (currentScreen == SCREEN_TASBEEH) {
+    currentScreen = SCREEN_PRAYER_TIMES;
+    drawPrayerScreen();
+  } else if (currentScreen == SCREEN_PRAYER_TIMES) {
+    currentScreen = SCREEN_RAMADAN;
+    drawRamadanScreen();
+  } else if (currentScreen == SCREEN_RAMADAN) {
+    currentScreen = SCREEN_TASBEEH;
+    drawTasbeehScreen();
+  }
 }
 
 void onDoubleClick() {
-  USBSerial.println("PWR: double click -> reset counter");
-  if (currentScreen != SCREEN_TASBEEH) return;
-  tasbeehCount = 0;
-  updateCounter();
+  if (currentScreen == SCREEN_TASBEEH) {
+    currentZikrIndex = (currentZikrIndex + 1) % zikrCount;
+    drawTasbeehScreen();
+  } else if (currentScreen == SCREEN_PRAYER_TIMES) {
+    fetchPrayerTimes();
+    drawPrayerScreen();
+  }
 }
 
 void onLongPress() {
-  USBSerial.println("PWR: long press -> TODO WiFi AP setup mode");
-  // TODO: следующий шаг — поднять WiFi AP + captive portal для настройки
-  // геопозиции/имён зикров/статистики. Пока просто показываем заглушку.
-  gfx->fillScreen(RGB565_BLACK);
-  gfx->setTextColor(RGB565_YELLOW);
-  gfx->setTextSize(2);
-  gfx->setCursor(10, LCD_HEIGHT / 2 - 10);
-  gfx->println("Setup mode");
-  gfx->setTextSize(1);
-  gfx->setCursor(10, LCD_HEIGHT / 2 + 20);
-  gfx->println("(coming soon)");
-  delay(1500);
-  currentScreen = SCREEN_TASBEEH;
-  drawTasbeehScreenStatic();
+  startConfigServer();
 }
