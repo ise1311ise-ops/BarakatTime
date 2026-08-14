@@ -1,6 +1,7 @@
 /*
 BarakatTime — прошивка для Waveshare ESP32-S3-Touch-LCD-1.69
-Дизайн: премиальный тёмно-зелёный интерфейс с золотыми акцентами, карточками и векторной графикой (без растровых картинок)
+Дизайн: премиальный тёмно-зелёный интерфейс с золотыми акцентами,
+карточками и векторной графикой (без растровых картинок)
 */
 
 #include <Arduino.h>
@@ -16,6 +17,12 @@ BarakatTime — прошивка для Waveshare ESP32-S3-Touch-LCD-1.69
 #include "Arduino_DriveBus_Library.h"
 #include "SensorPCF85063.hpp"
 #include "pin_config.h"
+
+// ---------- Векторные шрифты (встроены в Arduino_GFX, ничего конвертировать не нужно) ----------
+#include <Fonts/FreeSansBold24pt7b.h>   // крупные цифры (счётчик тасбиха, время до молитвы)
+#include <Fonts/FreeSansBold12pt7b.h>   // подзаголовки, время в списке молитв
+#include <Fonts/FreeSans9pt7b.h>        // подписи, мелкий текст
+#include <Fonts/FreeSansBold9pt7b.h>    // жирные мелкие подписи (BarakatTime, RAMADAN)
 
 HWCDC USBSerial;
 
@@ -61,9 +68,10 @@ AppScreen currentScreen = SCREEN_TASBEEH;
 #define COLOR_BG          0x0120  // глубокий тёмно-зелёный
 #define COLOR_BG_LIGHT    0x0221  // чуть светлее фон для карточек
 #define COLOR_GOLD        0xFD20  // премиальный золотой
-#define COLOR_GOLD_DIM    0x9440  // приглушённое золото (для фонового кольца)
+#define COLOR_GOLD_DIM    0x9440  // приглушённое золото (фоновое кольцо)
 #define COLOR_CARD_BG     0x1A42  // карточка
 #define COLOR_CARD_BORDER 0x3AA6  // тонкая окантовка карточки
+#define COLOR_CARD_BORDER_DIM 0x2124 // внутренняя тёмная окантовка (эффект глубины)
 #define COLOR_TEXT_DIM    0x7BEF  // приглушённый серо-зелёный текст
 #define COLOR_TEXT_WHITE  0xFFFF
 
@@ -126,27 +134,39 @@ void onLongPress();
 
 // ---------- Утилиты отрисовки ----------
 
-// Прямоугольная карточка со скруглением и тонкой золотой рамкой
+// Карточка с эффектом глубины: тёмная внутренняя рамка + светлая внешняя
 void drawCard(int x, int y, int w, int h, int r, bool withBorder = true) {
   gfx->fillRoundRect(x, y, w, h, r, COLOR_CARD_BG);
   if (withBorder) {
+    gfx->drawRoundRect(x + 1, y + 1, w - 2, h - 2, r - 1, COLOR_CARD_BORDER_DIM);
     gfx->drawRoundRect(x, y, w, h, r, COLOR_CARD_BORDER);
   }
 }
 
-// Текст по центру относительно заданной ширины области
-void drawCenteredText(const char *text, int areaX, int areaW, int y, uint8_t size, uint16_t color) {
-  int w = strlen(text) * 6 * size;
-  int x = areaX + (areaW - w) / 2;
+// Текст по центру относительно заданной ширины области — работает с любым векторным шрифтом
+void drawCenteredText(const char *text, int areaX, int areaW, int baselineY,
+                       const GFXfont *font, uint16_t color) {
+  gfx->setFont(font);
   gfx->setTextColor(color);
-  gfx->setTextSize(size);
-  gfx->setCursor(x, y);
-  gfx->println(text);
+  int16_t x1, y1;
+  uint16_t w, h;
+  gfx->getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+  int x = areaX + (areaW - (int)w) / 2 - x1;
+  gfx->setCursor(x, baselineY);
+  gfx->print(text);
+}
+
+// Текст по левому/правому краю с заданным шрифтом (для строк списка молитв)
+void drawText(const char *text, int x, int baselineY, const GFXfont *font, uint16_t color) {
+  gfx->setFont(font);
+  gfx->setTextColor(color);
+  gfx->setCursor(x, baselineY);
+  gfx->print(text);
 }
 
 // Кольцевой сегмент (arc) между двумя радиусами и углами (градусы, 0 = вправо, по часовой)
 void drawRingArc(int cx, int cy, int rOuter, int rInner, float startDeg, float endDeg, uint16_t color) {
-  for (float a = startDeg; a <= endDeg; a += 1.2f) {
+  for (float a = startDeg; a <= endDeg; a += 0.8f) {
     float rad = a * PI / 180.0f;
     int x1 = cx + cos(rad) * rOuter;
     int y1 = cy + sin(rad) * rOuter;
@@ -156,16 +176,17 @@ void drawRingArc(int cx, int cy, int rOuter, int rInner, float startDeg, float e
   }
 }
 
-// Кольцо прогресса (используется на экране тасбиха)
+// Утолщённое кольцо прогресса (двойной проход для более "жирной" линии без сглаживания)
 void drawProgressRing(int cx, int cy, int rOuter, int rInner, float progress) {
-  // фоновое (пройденное) кольцо приглушённым золотом
   drawRingArc(cx, cy, rOuter, rInner, -90, 270, COLOR_GOLD_DIM);
-  // активный прогресс — яркое золото, от вершины по часовой
+  drawRingArc(cx, cy - 1, rOuter, rInner, -90, 270, COLOR_GOLD_DIM);
+
   float endDeg = -90 + 360.0f * progress;
   drawRingArc(cx, cy, rOuter, rInner, -90, endDeg, COLOR_GOLD);
+  drawRingArc(cx, cy - 1, rOuter, rInner, -90, endDeg, COLOR_GOLD);
 }
 
-// Полумесяц (для экрана Рамадана) — золотой круг с "откушенным" фоновым кругом
+// Полумесяц (для экрана Рамадана)
 void drawCrescent(int cx, int cy, int r) {
   gfx->fillCircle(cx, cy, r, COLOR_GOLD);
   gfx->fillCircle(cx + r / 2, cy - r / 6, r, COLOR_CARD_BG);
@@ -182,7 +203,6 @@ void setup() {
   USBSerial.println("BarakatTime boot");
 
   setupDisplay();
-
   setupTouch();
   setupRtc();
   loadSettings();
@@ -305,19 +325,19 @@ void startConfigServer() {
 
   server.on("/", HTTP_GET, []() {
     String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>"
-                  "<style>body{font-family:sans-serif;padding:20px;background:#0b1a13;color:#fff;text-align:center;}"
-                  "input{padding:12px;margin:8px;width:85%;max-width:300px;background:#162e22;color:#fff;border:1px solid #c5a059;border-radius:8px;}"
-                  "input[type=submit]{background:#c5a059;color:#000;border:none;font-weight:bold;cursor:pointer;}"
-                  "</style></head><body>"
-                  "<h2>BarakatTime Setup</h2>"
-                  "<form action='/save' method='POST'>"
-                  "WiFi SSID:<br><input type='text' name='ssid'><br>"
-                  "WiFi Password:<br><input type='password' name='pass'><br>"
-                  "City:<br><input type='text' name='city' value='Moscow'><br>"
-                  "Country:<br><input type='text' name='country' value='Russia'><br>"
-                  "GMT Offset (sec):<br><input type='text' name='gmt' value='10800'><br><br>"
-                  "<input type='submit' value='Save & Restart'>"
-                  "</form></body></html>";
+                   "<style>body{font-family:sans-serif;padding:20px;background:#0b1a13;color:#fff;text-align:center;}"
+                   "input{padding:12px;margin:8px;width:85%;max-width:300px;background:#162e22;color:#fff;border:1px solid #c5a059;border-radius:8px;}"
+                   "input[type=submit]{background:#c5a059;color:#000;border:none;font-weight:bold;cursor:pointer;}"
+                   "</style></head><body>"
+                   "<h2>BarakatTime Setup</h2>"
+                   "<form action='/save' method='POST'>"
+                   "WiFi SSID:<br><input type='text' name='ssid'><br>"
+                   "WiFi Password:<br><input type='password' name='pass'><br>"
+                   "City:<br><input type='text' name='city' value='Moscow'><br>"
+                   "Country:<br><input type='text' name='country' value='Russia'><br>"
+                   "GMT Offset (sec):<br><input type='text' name='gmt' value='10800'><br><br>"
+                   "<input type='submit' value='Save & Restart'>"
+                   "</form></body></html>";
     server.send(200, "text/html", html);
   });
 
@@ -371,22 +391,20 @@ void drawTasbeehScreen() {
   int cx = LCD_WIDTH / 2;
   int cy = LCD_HEIGHT / 2 - 6;
 
-  // верхняя подпись
-  drawCenteredText("TASBEEH", 0, LCD_WIDTH, 20, 1, COLOR_TEXT_DIM);
+  drawCenteredText("TASBEEH", 0, LCD_WIDTH, 26, &FreeSansBold9pt7b, COLOR_TEXT_DIM);
 
-  // кольцо прогресса: прогресс = текущий круг из 33
   float progress = (tasbeehCount % 33) / 33.0f;
-  drawProgressRing(cx, cy, 88, 78, progress);
+  drawProgressRing(cx, cy, 88, 76, progress);
 
-  // внутренний круг-подложка под цифру
-  gfx->fillCircle(cx, cy, 68, COLOR_CARD_BG);
-  gfx->drawCircle(cx, cy, 68, COLOR_CARD_BORDER);
+  gfx->fillCircle(cx, cy, 66, COLOR_CARD_BG);
+  gfx->drawCircle(cx, cy, 66, COLOR_CARD_BORDER_DIM);
+  gfx->drawCircle(cx, cy, 67, COLOR_CARD_BORDER);
 
   char buf[12];
   snprintf(buf, sizeof(buf), "%lu", (unsigned long)tasbeehCount);
-  drawCenteredText(buf, 0, LCD_WIDTH, cy - 16, 4, COLOR_GOLD);
+  drawCenteredText(buf, 0, LCD_WIDTH, cy + 12, &FreeSansBold24pt7b, COLOR_GOLD);
 
-  drawCenteredText(zikrNames[currentZikrIndex], 0, LCD_WIDTH, cy + 30, 1, COLOR_TEXT_DIM);
+  drawCenteredText(zikrNames[currentZikrIndex], 0, LCD_WIDTH, cy + 46, &FreeSans9pt7b, COLOR_TEXT_DIM);
 
   drawPageDots(0);
 }
@@ -394,26 +412,25 @@ void drawTasbeehScreen() {
 void drawPrayerScreen() {
   gfx->fillScreen(COLOR_BG);
 
-  drawCenteredText("BarakatTime", 0, LCD_WIDTH, 14, 2, COLOR_GOLD);
+  drawCenteredText("BarakatTime", 0, LCD_WIDTH, 32, &FreeSansBold12pt7b, COLOR_GOLD);
 
   // hero-карточка со следующей молитвой
-  drawCard(15, 45, 210, 75, 14);
-  drawCenteredText(("Next - " + prayers.nextPrayerName).c_str(), 15, 210, 60, 1, COLOR_TEXT_DIM);
-  drawCenteredText(prayers.timeLeft.c_str(), 15, 210, 82, 3, COLOR_GOLD);
+  drawCard(15, 45, 210, 78, 14);
+  drawCenteredText(("Next \xE2\x80\x94 " + prayers.nextPrayerName).c_str(), 15, 210, 72, &FreeSans9pt7b, COLOR_TEXT_DIM);
+  drawCenteredText(prayers.timeLeft.c_str(), 15, 210, 108, &FreeSansBold24pt7b, COLOR_GOLD);
 
   // карточка со списком молитв
-  drawCard(15, 132, 210, 108, 14);
+  drawCard(15, 135, 210, 108, 14);
 
-  int y = 145;
+  int y = 160;
   auto row = [&](String name, String time, bool active) {
-    gfx->setTextColor(active ? COLOR_GOLD : COLOR_TEXT_DIM);
-    gfx->setTextSize(1);
-    gfx->setCursor(30, y);
-    gfx->print(name);
-    gfx->setTextColor(COLOR_GOLD);
-    gfx->setCursor(160, y);
-    gfx->println(time);
-    y += 20;
+    uint16_t c = active ? COLOR_GOLD : COLOR_TEXT_DIM;
+    drawText(name.c_str(), 32, y, &FreeSans9pt7b, c);
+    int16_t x1, y1; uint16_t w, h;
+    gfx->setFont(&FreeSansBold12pt7b);
+    gfx->getTextBounds(time.c_str(), 0, 0, &x1, &y1, &w, &h);
+    drawText(time.c_str(), 195 - w, y, &FreeSansBold12pt7b, COLOR_GOLD);
+    y += 24;
   };
 
   row("Fajr", prayers.fajr, prayers.nextPrayerName == "Fajr");
@@ -431,12 +448,12 @@ void drawRamadanScreen() {
 
   drawCrescent(50, 60, 18);
 
-  drawCenteredText("RAMADAN", 15, 210, 90, 2, COLOR_GOLD);
-  drawCenteredText("127", 15, 210, 118, 4, COLOR_TEXT_WHITE);
-  drawCenteredText("days left", 15, 210, 158, 1, COLOR_TEXT_DIM);
+  drawCenteredText("RAMADAN", 15, 210, 100, &FreeSansBold9pt7b, COLOR_GOLD);
+  drawCenteredText("127", 15, 210, 150, &FreeSansBold24pt7b, COLOR_TEXT_WHITE);
+  drawCenteredText("days left", 15, 210, 170, &FreeSans9pt7b, COLOR_TEXT_DIM);
 
-  gfx->fillRoundRect(30, 178, 180, 26, 8, COLOR_BG_LIGHT);
-  drawCenteredText(("City: " + city).c_str(), 30, 180, 186, 1, COLOR_GOLD);
+  gfx->fillRoundRect(30, 182, 180, 26, 8, COLOR_BG_LIGHT);
+  drawCenteredText(("City: " + city).c_str(), 30, 180, 200, &FreeSans9pt7b, COLOR_GOLD);
 
   drawPageDots(2);
 }
@@ -444,23 +461,27 @@ void drawRamadanScreen() {
 void drawSetupScreen() {
   gfx->fillScreen(COLOR_BG);
 
-  drawCenteredText("WiFi Setup", 0, LCD_WIDTH, 24, 2, COLOR_GOLD);
+  drawCenteredText("WiFi Setup", 0, LCD_WIDTH, 40, &FreeSansBold12pt7b, COLOR_GOLD);
 
   drawCard(15, 70, 210, 130, 14);
 
-  drawCenteredText("Connect to:", 15, 210, 90, 1, COLOR_TEXT_DIM);
-  drawCenteredText("BarakatTime-Setup", 15, 210, 108, 1, COLOR_GOLD);
+  drawCenteredText("Connect to:", 15, 210, 100, &FreeSans9pt7b, COLOR_TEXT_DIM);
+  drawCenteredText("BarakatTime-Setup", 15, 210, 122, &FreeSansBold9pt7b, COLOR_GOLD);
 
-  drawCenteredText("Open in browser:", 15, 210, 140, 1, COLOR_TEXT_DIM);
-  drawCenteredText("192.168.4.1", 15, 210, 158, 2, COLOR_GOLD);
+  drawCenteredText("Open in browser:", 15, 210, 155, &FreeSans9pt7b, COLOR_TEXT_DIM);
+  drawCenteredText("192.168.4.1", 15, 210, 180, &FreeSansBold12pt7b, COLOR_GOLD);
 }
 
 void drawPageDots(uint8_t activePage) {
   int startX = LCD_WIDTH / 2 - 20;
   int y = LCD_HEIGHT - 18;
   for (int i = 0; i < 3; i++) {
-    uint16_t color = (i == activePage) ? COLOR_GOLD : COLOR_TEXT_DIM;
-    gfx->fillCircle(startX + (i * 20), y, 3, color);
+    if (i == activePage) {
+      gfx->drawCircle(startX + (i * 20), y, 5, COLOR_GOLD_DIM);
+      gfx->fillCircle(startX + (i * 20), y, 3, COLOR_GOLD);
+    } else {
+      gfx->fillCircle(startX + (i * 20), y, 3, COLOR_TEXT_DIM);
+    }
   }
 }
 
@@ -489,7 +510,7 @@ void handleTouch() {
     preferences.putUInt("tasbeeh", tasbeehCount);
     preferences.end();
 
-    drawTasbeehScreen();  // перерисовка целиком — кольцо прогресса нужно обновлять корректно
+    drawTasbeehScreen();
   }
 }
 
